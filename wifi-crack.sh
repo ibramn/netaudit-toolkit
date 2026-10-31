@@ -131,8 +131,9 @@ fi
 if [ -n "$BSSID" ]; then
   row=$(grep -i "^$BSSID" "$scan"-01.csv 2>/dev/null | head -1)
 else
-  row=$(awk -F, -v s=",${SSID}," 'index($0,s)>0 && $1 ~ /:/{print; exit}' "$scan"-01.csv 2>/dev/null)
-  [ -z "$row" ] && row=$(awk -F, -v s=",${SSID}" 'index($0,s)>0 && $1 ~ /:/{print; exit}' "$scan"-01.csv 2>/dev/null)
+  # match on the ESSID column (CSV field 14), trimmed — airodump pads every field with a
+  # leading space, so a substring search for ",SSID," never matches a real row
+  row=$(awk -F, -v want="$SSID" '$1 ~ /:/{e=$14; gsub(/^[ \t]+|[ \t]+$/,"",e); if(e==want){print; exit}}' "$scan"-01.csv 2>/dev/null)
 fi
 [ -n "${row:-}" ] || { err "target not seen in scan — is it on / in range? try -c <channel> or move closer"; exit 1; }
 [ -z "$BSSID" ] && BSSID=$(echo "$row" | cut -d, -f1 | tr -d ' ')
