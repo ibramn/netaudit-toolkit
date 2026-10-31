@@ -94,7 +94,12 @@ else err "could not enable monitor mode on $IFACE"; exit 1; fi
 # ---------- scan / resolve target ----------
 step "Scanning for target"
 scan="$OUTDIR/scan"; rm -f "$scan"-*.csv
-timeout 20 airodump-ng --output-format csv -w "$scan" "$MON" >/dev/null 2>&1 || true
+if [ -n "$CHAN" ]; then
+  iw dev "$MON" set channel "$CHAN" 2>/dev/null
+  timeout -k 5 15 airodump-ng -c "$CHAN" --output-format csv -w "$scan" "$MON" >/dev/null 2>&1 || true
+else
+  timeout -k 5 20 airodump-ng --output-format csv -w "$scan" "$MON" >/dev/null 2>&1 || true
+fi
 if [ -n "$BSSID" ]; then
   row=$(grep -i "^$BSSID" "$scan"-01.csv 2>/dev/null | head -1)
 else
@@ -116,7 +121,7 @@ else
   warn "injection self-test inconclusive (rtw88 often fails the test yet still injects) — continuing"
 fi
 if command -v wash >/dev/null; then
-  wrow=$(timeout 15 wash -i "$MON" -c "$CHAN" 2>/dev/null | grep -i "$BSSID" | head -1)
+  wrow=$(timeout -k 3 15 wash -i "$MON" -c "$CHAN" 2>/dev/null | grep -i "$BSSID" | head -1)
   if [ -n "${wrow:-}" ]; then
     echo "$wrow" | grep -qi ' yes ' && warn "WPS ENABLED but LOCKED on $BSSID" \
                                     || warn "WPS ENABLED & UNLOCKED on $BSSID — extra exposure"
