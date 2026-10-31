@@ -1,0 +1,13 @@
+# capture / scan artifacts
+*.cap
+*.pcapng
+*.hc22000
+*.hccapx
+*-01.csv
+*.netxml
+# generated reports
+net-audit-*.txt
+wifi-audit-*.txt
+# misc
+*.log
+.DS_Store
