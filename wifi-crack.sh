@@ -47,19 +47,41 @@ err(){  printf "${R}[%s] [x] %s${N}\n" "$(ts)" "$*"; }
 OUTDIR="wifi-crack-$(echo "${SSID:-$BSSID}" | tr -c 'A-Za-z0-9' _)-$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUTDIR"; LOG="$OUTDIR/run.log"
 exec > >(tee -a "$LOG") 2>&1
-MON="$IFACE"; AIRO_PID=""
+MON="$IFACE"; AIRO_PID=""; DRV=""; CLEANED=0
 
+# ---------- reset: always put the radio + networking back the way we found them ----------
 cleanup(){
+  [ "$CLEANED" = 1 ] && return 0; CLEANED=1
+  # stop anything we started on the radio
   [ -n "${AIRO_PID:-}" ] && kill "$AIRO_PID" 2>/dev/null
-  pkill -f "airodump-ng.*$MON" 2>/dev/null
-  info "restoring $IFACE to managed mode"
+  for p in airodump-ng aireplay-ng reaver wash; do pkill -f "$p.*$MON" 2>/dev/null; done
+  info "reset: restoring $IFACE to managed mode and bringing networking back"
+  # if a radio reset was interrupted with the USB driver unloaded, reload it first
+  if [ ! -e "/sys/class/net/$IFACE" ] && [ -n "$DRV" ]; then
+    modprobe "$DRV" 2>/dev/null; sleep 2
+  fi
+  rfkill unblock wifi 2>/dev/null
   ip link set "$MON" down 2>/dev/null
   iw dev "$MON" set type managed 2>/dev/null
   ip link set "$MON" up 2>/dev/null
-  nmcli dev set "$MON" managed yes 2>/dev/null
-  systemctl restart NetworkManager 2>/dev/null
+  # airmon-ng check kill stopped these on the way in — start them again
+  nmcli dev set "$IFACE" managed yes 2>/dev/null
+  systemctl restart wpa_supplicant 2>/dev/null || service wpa_supplicant restart 2>/dev/null || true
+  systemctl restart NetworkManager 2>/dev/null || service NetworkManager restart 2>/dev/null || true
+  nmcli dev connect "$IFACE" 2>/dev/null || true
+  # give NetworkManager a few seconds to reassociate + DHCP, then report
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    iw dev "$IFACE" link 2>/dev/null | grep -qi 'Connected to' && break
+    sleep 1
+  done
+  if iw dev "$IFACE" link 2>/dev/null | grep -qi 'Connected to'; then
+    ok "reset done — $IFACE reconnected to $(iw dev "$IFACE" link 2>/dev/null | sed -n 's/.*SSID: //p' | head -1)"
+  else
+    warn "reset done — $IFACE is managed again but not reconnected yet; run:  nmcli dev connect $IFACE"
+  fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 
 step "Preflight"
 for t in airmon-ng airodump-ng aireplay-ng aircrack-ng iw; do
@@ -71,6 +93,7 @@ ok "AUTHORISED OWN-NETWORK USE ONLY. Artifacts -> $OUTDIR/"
 
 # ---------- monitor mode (with driver-reset fallback for rtw88-style cards) ----------
 enable_monitor(){
+  [ -z "$DRV" ] && DRV=$(basename "$(readlink -f "/sys/class/net/$IFACE/device/driver" 2>/dev/null)" 2>/dev/null)
   nmcli dev set "$IFACE" managed no 2>/dev/null
   airmon-ng check kill >/dev/null 2>&1
   ip link set "$IFACE" down
