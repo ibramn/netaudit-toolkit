@@ -72,3 +72,21 @@ MIT — see [LICENSE](LICENSE).
 Provided for educational and authorized security-assessment purposes only, with no
 warranty of any kind. The author accepts no liability for misuse or for any damage
 caused by these tools.
+
+## wifi-crack.sh — end-to-end WPA audit (one command)
+
+Chains the whole workflow with a timestamped progress log: monitor mode → scan &
+resolve target → confirm injection + WPS → capture the 4-way handshake (auto-deauth,
+with a radio reset if the USB adapter wedges) → build a wordlist → `aircrack-ng`.
+
+```bash
+# dictionary attack with rockyou:
+sudo ./wifi-crack.sh -i wlan0 -s "MyWiFi"
+# targeted wordlist generated from keywords (+ numbers):
+sudo ./wifi-crack.sh -i wlan0 -s "MyWiFi" -k "john home city 1990 1234"
+# just capture the handshake, no crack:
+sudo ./wifi-crack.sh -i wlan0 -s "MyWiFi" --no-crack
+```
+
+Artifacts (handshake, wordlist, logs, `RESULT.txt`) are written to a timestamped
+`wifi-crack-*/` directory. `-h` prints full options. Authorised / own-network use only.
